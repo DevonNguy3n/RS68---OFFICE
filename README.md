@@ -1,6 +1,6 @@
 # RS68 Office
 
-Văn phòng Content AI chạy local với giao diện 3D xoay/zoom, quản lý agent, task và quy trình QC. Bản đầu tiên dùng ChatGPT cho mọi vai trò; tích hợp API AI thật sẽ được thêm ở mốc kế tiếp. Không nhập cookie hoặc API key vào mã nguồn.
+Văn phòng Content AI chạy local với giao diện 3D xoay/zoom, quản lý agent, task và quy trình QC. Nhân vật 3D chỉ là giao diện đại diện cho vai trò; hiện chưa có tiến trình nền tự nhận và xử lý task. Khi chưa đặt `OPENAI_API_KEY`, trò chuyện và cuộc họp dùng phản hồi local từ dữ liệu task, không tạo nội dung AI thật. Không nhập cookie hoặc API key vào mã nguồn.
 
 ## Chạy local
 
