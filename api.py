@@ -23,6 +23,7 @@ AGENTS = [
     {'id': 'researcher', 'name': 'Nhân viên nghiên cứu', 'role': 'Thu thập nguồn', 'provider': 'ChatGPT'},
     {'id': 'writer', 'name': 'Nhân viên viết', 'role': 'Viết nội dung', 'provider': 'ChatGPT'},
 ]
+REVIEW_CHAIN = ('research-lead', 'content-lead', 'manager', 'director')
 STATUSES = {'DRAFT', 'ASSIGNED', 'IN_PROGRESS', 'SUBMITTED', 'REVISION_REQUIRED', 'APPROVED', 'COMPLETED', 'BLOCKED'}
 TRANSITIONS = {'DRAFT': {'ASSIGNED'}, 'ASSIGNED': {'IN_PROGRESS', 'BLOCKED'}, 'IN_PROGRESS': {'SUBMITTED', 'BLOCKED'}, 'SUBMITTED': {'APPROVED', 'REVISION_REQUIRED'}, 'REVISION_REQUIRED': {'IN_PROGRESS'}, 'APPROVED': {'COMPLETED'}, 'BLOCKED': {'IN_PROGRESS'}}
 
@@ -132,18 +133,25 @@ def agent_chat(data: AgentMessage):
 def agent_meeting():
     with connect() as db:
         task = db.execute('SELECT id,title,status,assignee FROM tasks ORDER BY id DESC LIMIT 1').fetchone()
+        review_rows = []
+        if task:
+            draft = db.execute('SELECT id FROM drafts WHERE task_id=? ORDER BY id DESC LIMIT 1', (task['id'],)).fetchone()
+            if draft:
+                review_rows = [dict(row) for row in db.execute('SELECT reviewer,decision,note FROM reviews WHERE draft_id=? ORDER BY id', (draft['id'],))]
     if not task:
         return {'mode': 'local', 'messages': [{'agent_id': 'director', 'text': 'Chưa có nhiệm vụ. Hãy tạo task để bắt đầu trao đổi.'}]}
     task = dict(task)
     assignee = next((agent for agent in AGENTS if agent['id'] == task['assignee']), AGENTS[-1])
+    review_by_role = {row['reviewer']: row for row in review_rows}
+    participants = ['director', 'research-lead', 'content-lead', 'manager', assignee['id']]
     key = os.getenv('OPENAI_API_KEY')
     if key:
         payload = {'model': os.getenv('OPENAI_MODEL', 'gpt-5-mini'), 'store': False,
-                   'instructions': ('Tạo cuộc trao đổi công việc ngắn bằng tiếng Việt giữa phó giám đốc, quản lý và nhân viên được giao task. '
-                                    'Chỉ dựa trên dữ liệu task được cung cấp. Không khẳng định đã thực hiện việc chưa được ghi nhận. '
-                                    'Chỉ trả JSON array có đúng 3 object, mỗi object gồm agent_id và text. '
-                                    f'agent_id lần lượt là director, manager, {assignee["id"]}.'),
-                   'input': json.dumps(task, ensure_ascii=False)}
+                   'instructions': ('Tạo cuộc họp ngắn bằng tiếng Việt giữa phó giám đốc, hai leader, quản lý và người nhận task. '
+                                    'Hai leader và quản lý phản biện chéo dựa trên review đã lưu; nếu chưa review thì nói rõ đang chờ, không giả vờ đã duyệt. '
+                                    'Không khẳng định công việc chưa được ghi nhận. Chỉ trả JSON array có đúng 5 object, mỗi object gồm agent_id và text. '
+                                    f'agent_id theo đúng thứ tự: {", ".join(participants)}.'),
+                   'input': json.dumps({'task': task, 'reviews': review_rows}, ensure_ascii=False)}
         request = Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
                           headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}, method='POST')
         try:
@@ -152,20 +160,21 @@ def agent_meeting():
             raw = '\n'.join(part.get('text', '') for item in result.get('output', [])
                             for part in item.get('content', []) if part.get('type') == 'output_text').strip()
             messages = json.loads(raw)
-            allowed = {'director', 'manager', assignee['id']}
-            if not isinstance(messages, list) or len(messages) != 3 or any(
-                not isinstance(item, dict) or item.get('agent_id') not in allowed or not isinstance(item.get('text'), str)
-                for item in messages
+            if not isinstance(messages, list) or len(messages) != 5 or any(
+                not isinstance(item, dict) or item.get('agent_id') != participants[i] or not isinstance(item.get('text'), str) or not item['text'].strip()
+                for i, item in enumerate(messages)
             ):
                 raise ValueError('Invalid meeting response')
             return {'mode': 'ai', 'task_id': task['id'], 'messages': messages}
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             raise HTTPException(502, 'AI meeting request failed') from exc
-    return {'mode': 'local', 'task_id': task['id'], 'messages': [
-        {'agent_id': 'director', 'text': f'Task #{task["id"]}: {task["title"]}. Trạng thái hiện tại: {task["status"]}.'},
-        {'agent_id': 'manager', 'text': f'{assignee["name"]} đang được giao nhiệm vụ này. Tôi sẽ theo dõi tiến độ trong hồ sơ task.'},
-        {'agent_id': assignee['id'], 'text': 'Tôi sẽ làm theo brief và cập nhật qua nguồn, bản nháp hoặc kết quả của task.'},
-    ]}
+    messages = [{'agent_id': 'director', 'text': f'Task #{task["id"]}: {task["title"]}. Trạng thái: {task["status"]}. Mời các bộ phận đối chiếu kết quả.'}]
+    for agent_id, topic in [('research-lead', 'nguồn và dữ kiện'), ('content-lead', 'nội dung và ngôn ngữ'), ('manager', 'tổng hợp phản biện')]:
+        review = review_by_role.get(agent_id)
+        text = f'Đã review {topic}: {review["decision"]}. {review["note"]}' if review else f'Chưa có review {topic} được lưu cho bản nháp hiện tại.'
+        messages.append({'agent_id': agent_id, 'text': text})
+    messages.append({'agent_id': assignee['id'], 'text': 'Tôi sẽ cập nhật bản nháp và phản hồi các nhận xét đã lưu trong hồ sơ task.'})
+    return {'mode': 'local', 'task_id': task['id'], 'messages': messages}
 
 def task_or_404(db, task_id):
     row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
@@ -225,7 +234,7 @@ def reviews(task_id: int):
 
 @app.post('/api/tasks/{task_id}/reviews', status_code=201)
 def add_review(task_id: int, data: ReviewCreate):
-    if data.reviewer not in {'content-lead', 'manager', 'director'}:
+    if data.reviewer not in REVIEW_CHAIN:
         raise HTTPException(403, 'Reviewer role required')
     required = {'brief', 'facts', 'originality', 'language'}
     if set(data.checklist) != required:
@@ -332,8 +341,8 @@ def transition(task_id: int, data: Transition):
             if data.status == 'APPROVED':
                 passed = {item['reviewer'] for item in db.execute(
                     'SELECT reviewer FROM reviews WHERE draft_id=? AND decision="pass"', (newest_draft['id'],))}
-                if not {'content-lead', 'manager', 'director'} <= passed:
-                    raise HTTPException(422, 'Cross-layer reviews from content lead, manager and director required')
+                if not set(REVIEW_CHAIN) <= passed:
+                    raise HTTPException(422, 'Cross-layer reviews from both leads, manager and director required')
         now = datetime.now(timezone.utc).isoformat()
         db.execute('UPDATE tasks SET status=?, result=? WHERE id=?', (data.status, result, task_id))
         db.execute('INSERT INTO events(task_id,from_status,to_status,reason,created_at) VALUES(?,?,?,?,?)', (task_id, row['status'], data.status, data.reason, now))
@@ -357,17 +366,18 @@ def agent_steps(task_id: int):
         task_or_404(db, task_id)
         return [dict(row) for row in db.execute('SELECT * FROM agent_steps WHERE task_id=? ORDER BY id DESC', (task_id,))]
 
-def ai_review(task, draft, reviewer):
+def ai_review(task, draft, reviewer, previous_reviews, sources):
     key = os.getenv('OPENAI_API_KEY')
     payload = {
         'model': os.getenv('OPENAI_MODEL', 'gpt-5-mini'), 'store': False,
         'instructions': ('Bạn là ' + reviewer['name'] + ' trong quy trình review chéo của RS68. '
+                         'Đọc nhận xét của các vai trò trước, nêu rõ điểm đồng ý hoặc phản biện trong note; tự đánh giá độc lập, không tự động tin người trước. '
                          'Đánh giá độc lập bản nháp theo brief và nguồn đã lưu. Với tin tức: không xác nhận sự kiện nếu nguồn không hỗ trợ; '
                          'với truyện AI: kiểm tra nhãn hư cấu. Không truy cập web, không bịa bằng chứng. '
                          'Chỉ trả một JSON object gồm decision (pass hoặc revise), checklist '
                          '(brief, facts, originality, language: boolean), note (lý do ngắn). '
                          'Chỉ pass khi cả bốn tiêu chí chắc chắn đạt. Nếu không chắc chắn, revise và ghi rõ cần kiểm tra.'),
-        'input': json.dumps({'task': dict(task), 'draft': dict(draft)}, ensure_ascii=False),
+        'input': json.dumps({'task': dict(task), 'draft': dict(draft), 'previous_reviews': previous_reviews, 'sources': sources}, ensure_ascii=False),
     }
     request = Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
                       headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}, method='POST')
@@ -427,20 +437,24 @@ def run_agent_cycle(task_id: int):
             if not draft:
                 raise HTTPException(422, 'Draft required')
             draft = dict(draft)
-            reviewed = {row['reviewer'] for row in db.execute('SELECT reviewer FROM reviews WHERE draft_id=?', (draft['id'],))}
-        for agent_id in ('content-lead', 'manager', 'director'):
+            previous_reviews = [dict(row) for row in db.execute('SELECT reviewer,decision,note,checklist FROM reviews WHERE draft_id=? ORDER BY id', (draft['id'],))]
+            reviewed = {row['reviewer'] for row in previous_reviews}
+            sources = [dict(row) for row in db.execute('SELECT title,url,note,verified FROM sources WHERE task_id=?', (task_id,))]
+        for agent_id in REVIEW_CHAIN:
             if agent_id in reviewed:
                 continue
             reviewer = next(agent for agent in AGENTS if agent['id'] == agent_id)
-            decision = ai_review(task, draft, reviewer)
+            decision = ai_review(task, draft, reviewer, previous_reviews, sources)
             add_review(task_id, decision)
             save_agent_step(task_id, agent_id, 'review', f'{decision.decision}: {decision.note}')
+            if previous_reviews:
+                save_agent_step(task_id, agent_id, 'review-discussion', f'{reviewer["name"]} phản hồi ý kiến của {previous_reviews[-1]["reviewer"]}: {decision.note}')
             if decision.decision == 'revise':
                 transition(task_id, Transition(status='REVISION_REQUIRED', reason=decision.note))
                 return {'task_id': task_id, 'status': 'REVISION_REQUIRED', 'action': 'revision_requested', 'reviewer': agent_id}
             return {'task_id': task_id, 'status': 'SUBMITTED', 'action': 'review_passed', 'reviewer': agent_id}
         transition(task_id, Transition(status='APPROVED'))
-        save_agent_step(task_id, 'director', 'approval', 'Đã duyệt qua ba tầng; chờ người dùng hoàn thành task.')
+        save_agent_step(task_id, 'director', 'approval', 'Đã duyệt chéo qua hai leader, quản lý và phó giám đốc; chờ người dùng hoàn thành task.')
         return {'task_id': task_id, 'status': 'APPROVED', 'action': 'approved'}
     finally:
         RUN_LOCK.release()

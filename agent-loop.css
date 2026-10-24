@@ -34,3 +34,5 @@ body,.app{background:#01040b}
 .mini-map b{font-size:9px;letter-spacing:.09em;color:#9fe7f2}.mini-map small{font-size:8px;line-height:1.4}.map-grid{width:100%;height:58px;margin:8px 0 6px;padding:3px;background:none;border:0;gap:4px}.map-grid button{border-radius:5px;background:#0b3446;border-color:#1d728b;box-shadow:none}.map-grid button:hover{background:#105a6f}
 .agent-label{background:#041725ed;border-color:#2fb6cf;border-radius:5px;box-shadow:0 5px 14px #000b,0 0 10px #07a8cd44;color:#d7f9ff}
 @media(max-width:760px){.view-controls{left:8px!important;right:8px!important;transform:none;max-width:none!important}.mini-map{transform:scale(.76);transform-origin:left bottom}}
+.meeting-scene .mini-map{display:none}.meeting-scene .meeting-card{top:78px;bottom:auto;right:16px;max-height:240px;overflow:auto;background:#03121eea;backdrop-filter:blur(12px)}
+@media(max-width:760px){.meeting-scene .meeting-card{top:65px;right:8px;width:min(310px,calc(100% - 16px));max-height:210px}}

@@ -60,6 +60,15 @@ class WorkflowTests(unittest.TestCase):
             if old_key is not None:
                 os.environ['OPENAI_API_KEY'] = old_key
 
+    def test_meeting_names_all_review_roles_without_claiming_unrecorded_work(self):
+        with patch.dict(os.environ, {'OPENAI_API_KEY': ''}):
+            meeting = self.client.get('/api/agent-meeting')
+        self.assertEqual(meeting.status_code, 200)
+        messages = meeting.json()['messages']
+        self.assertEqual([item['agent_id'] for item in messages],
+                         ['director', 'research-lead', 'content-lead', 'manager', 'writer'])
+        self.assertIn('Chưa có review', messages[1]['text'])
+
     def test_qc_requires_draft_and_independent_review(self):
         self.assertEqual(self.move('ASSIGNED').status_code, 200)
         self.assertEqual(self.move('IN_PROGRESS').status_code, 200)
@@ -71,10 +80,10 @@ class WorkflowTests(unittest.TestCase):
         checklist = {'brief': True, 'facts': True, 'originality': True, 'language': True}
         own = self.client.post(f'/api/tasks/{self.task_id}/reviews', json={'reviewer': 'writer', 'decision': 'pass', 'checklist': checklist})
         self.assertEqual(own.status_code, 403)
-        for reviewer in ('content-lead', 'manager', 'director'):
+        for reviewer in api.REVIEW_CHAIN:
             good = self.client.post(f'/api/tasks/{self.task_id}/reviews', json={'reviewer': reviewer, 'decision': 'pass', 'checklist': checklist})
             self.assertEqual(good.status_code, 201)
-            if reviewer != 'director':
+            if reviewer != api.REVIEW_CHAIN[-1]:
                 self.assertEqual(self.move('APPROVED').status_code, 422)
         self.assertEqual(self.move('APPROVED').status_code, 200)
         self.assertEqual(self.move('COMPLETED').status_code, 200)
@@ -82,12 +91,19 @@ class WorkflowTests(unittest.TestCase):
 
     def test_agent_loop_requires_source_and_cross_layer_reviews(self):
         self.assertEqual(self.move('ASSIGNED').status_code, 200)
-        with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'}), patch.object(api, 'generate', side_effect=lambda _id, req: {'content': 'Nội dung nghiên cứu có nguồn' if req.mode == 'research' else 'Bản nháp tin tức có nguồn xác minh'}), patch.object(api, 'ai_review', side_effect=lambda _task, _draft, reviewer: api.ReviewCreate(reviewer=reviewer['id'], decision='pass', checklist={'brief': True, 'facts': True, 'originality': True, 'language': True})):
+        review_inputs = []
+        def mock_review(_task, _draft, reviewer, previous, sources):
+            review_inputs.append((reviewer['id'], [item['reviewer'] for item in previous], len(sources)))
+            return api.ReviewCreate(reviewer=reviewer['id'], decision='pass', checklist={'brief': True, 'facts': True, 'originality': True, 'language': True})
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'}), patch.object(api, 'generate', side_effect=lambda _id, req: {'content': 'Nội dung nghiên cứu có nguồn' if req.mode == 'research' else 'Bản nháp tin tức có nguồn xác minh'}), patch.object(api, 'ai_review', side_effect=mock_review):
             waiting = self.client.post(f'/api/tasks/{self.task_id}/run')
             self.assertEqual(waiting.json()['action'], 'waiting_for_verified_source')
             self.client.post(f'/api/tasks/{self.task_id}/sources', json={'title': 'Nguồn chính thức', 'url': 'https://example.org/story', 'verified': True})
-            actions = [self.client.post(f'/api/tasks/{self.task_id}/run').json()['action'] for _ in range(5)]
-        self.assertEqual(actions, ['draft_submitted', 'review_passed', 'review_passed', 'review_passed', 'approved'])
+            actions = [self.client.post(f'/api/tasks/{self.task_id}/run').json()['action'] for _ in range(6)]
+        self.assertEqual(actions, ['draft_submitted', 'review_passed', 'review_passed', 'review_passed', 'review_passed', 'approved'])
+        reviewers = [review['reviewer'] for review in self.client.get(f'/api/tasks/{self.task_id}/reviews').json()][::-1]
+        self.assertEqual(reviewers, list(api.REVIEW_CHAIN))
+        self.assertEqual(review_inputs, [(role, list(api.REVIEW_CHAIN[:i]), 1) for i, role in enumerate(api.REVIEW_CHAIN)])
         self.assertEqual(self.client.get(f'/api/tasks/{self.task_id}/agent-steps').status_code, 200)
         self.assertEqual(self.client.get('/api/tasks').json()[0]['status'], 'APPROVED')
 
