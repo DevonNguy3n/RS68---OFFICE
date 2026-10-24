@@ -23,4 +23,15 @@ npm run dev
 
 Truy cập `http://localhost:5173`. API docs ở `http://127.0.0.1:8000/docs`.
 
-Mốc đầu: chọn agent trong văn phòng 3D, tạo task tin tức Mỹ/truyện AI, chuyển trạng thái có kiểm tra điều kiện và audit log. Dữ liệu lưu local bằng SQLite. Mốc tiếp theo sẽ thêm adapter OpenAI, nguồn nghiên cứu, phiên bản nội dung và QC checklist.
+Văn phòng cho phép chọn agent, tạo task tin tức Mỹ/truyện AI, lưu nguồn, tạo nhiều phiên bản nội dung, kiểm duyệt độc lập và phê duyệt. Các trạng thái và thao tác được lưu trong audit log SQLite.
+
+Mở hồ sơ task để dùng luồng nguồn → bản nháp → QC. Chế độ mẫu cho phép kiểm thử mà không gọi API AI. Để dùng OpenAI thật, đặt `OPENAI_API_KEY` và tùy chọn `OPENAI_MODEL` trong môi trường của terminal chạy Backend, rồi bỏ chọn **Chế độ mẫu**. Không đưa khóa vào repo hoặc trình duyệt. API gọi Responses API theo [tài liệu chính thức của OpenAI](https://developers.openai.com/api/docs/guides/text?lang=python).
+
+Nội dung tin tức cần nguồn đã xác minh; AI không tự xuất bản. Nội dung truyện AI cần được ghi rõ là hư cấu. Kết quả AI và checklist vẫn cần người dùng kiểm tra trước khi phê duyệt.
+
+## Kiểm tra
+
+```powershell
+python -m unittest -v test_api.py
+npm run build
+```
