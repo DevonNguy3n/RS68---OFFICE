@@ -83,6 +83,38 @@ class AgentMessage(BaseModel):
     agent_id: str
     message: str = Field(min_length=1, max_length=2000)
 
+
+def ai_settings():
+    provider = os.getenv('AI_PROVIDER', 'openai').lower()
+    if provider == 'muse2api':
+        return (os.getenv('AI_API_KEY') or os.getenv('MUSE2API_KEY'),
+                os.getenv('AI_BASE_URL', 'http://127.0.0.1:18610/v1').rstrip('/'),
+                os.getenv('AI_MODEL', 'muse-spark'))
+    if provider == 'openai':
+        return (os.getenv('AI_API_KEY') or os.getenv('OPENAI_API_KEY'),
+                os.getenv('AI_BASE_URL', 'https://api.openai.com/v1').rstrip('/'),
+                os.getenv('AI_MODEL') or os.getenv('OPENAI_MODEL', 'gpt-5-mini'))
+    raise HTTPException(503, 'Unsupported AI_PROVIDER')
+
+
+def ai_text(instructions, input_data):
+    key, base_url, model = ai_settings()
+    if not key:
+        raise HTTPException(503, 'AI provider key is not configured')
+    payload = {'model': model, 'store': False, 'instructions': instructions, 'input': input_data}
+    request = Request(f'{base_url}/responses', data=json.dumps(payload).encode(),
+                      headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}, method='POST')
+    try:
+        with urlopen(request, timeout=60) as response:
+            result = json.load(response)
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise HTTPException(502, 'AI provider request failed') from exc
+    content = '\n'.join(part.get('text', '') for item in result.get('output', [])
+                        for part in item.get('content', []) if part.get('type') == 'output_text').strip()
+    if not content:
+        raise HTTPException(502, 'AI returned no text')
+    return content
+
 @app.get('/api/dashboard')
 def dashboard():
     with connect() as db:
@@ -105,7 +137,7 @@ def agent_chat(data: AgentMessage):
         raise HTTPException(422, 'Unknown agent')
     with connect() as db:
         task_rows = [dict(row) for row in db.execute('SELECT id,title,status,brief FROM tasks WHERE assignee=? ORDER BY id DESC LIMIT 5', (data.agent_id,))]
-    key = os.getenv('OPENAI_API_KEY')
+    key = ai_settings()[0]
     if not key:
         if task_rows:
             latest = task_rows[0]
@@ -113,20 +145,9 @@ def agent_chat(data: AgentMessage):
         else:
             reply = 'Hiện tôi chưa được giao task nào. Hãy giao việc trong Trung tâm điều hành để bắt đầu.'
         return {'agent_id': data.agent_id, 'reply': reply, 'mode': 'local', 'tasks': task_rows}
-    payload = {'model': os.getenv('OPENAI_MODEL', 'gpt-5-mini'), 'store': False,
-               'instructions': f'Bạn là {agent["name"]} của công ty content AI. Vai trò: {agent["role"]}. Trả lời ngắn bằng tiếng Việt. Chỉ xem dữ liệu task cung cấp là sự thật; không bịa tiến độ, nguồn tin hoặc công việc đã làm. Không tự xuất bản.',
-               'input': json.dumps({'user_message': data.message, 'assigned_tasks': task_rows}, ensure_ascii=False)}
-    request = Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
-                      headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}, method='POST')
-    try:
-        with urlopen(request, timeout=60) as response:
-            result = json.load(response)
-        reply = '\n'.join(part.get('text', '') for item in result.get('output', [])
-                          for part in item.get('content', []) if part.get('type') == 'output_text')
-        if not reply:
-            raise HTTPException(502, 'AI returned no text')
-    except (HTTPError, URLError, TimeoutError) as exc:
-        raise HTTPException(502, 'AI provider request failed') from exc
+    reply = ai_text(
+        f'Bạn là {agent["name"]} của công ty content AI. Vai trò: {agent["role"]}. Trả lời ngắn bằng tiếng Việt. Chỉ xem dữ liệu task cung cấp là sự thật; không bịa tiến độ, nguồn tin hoặc công việc đã làm. Không tự xuất bản.',
+        json.dumps({'user_message': data.message, 'assigned_tasks': task_rows}, ensure_ascii=False))
     return {'agent_id': data.agent_id, 'reply': reply, 'mode': 'ai', 'tasks': task_rows}
 
 @app.get('/api/agent-meeting')
@@ -144,21 +165,14 @@ def agent_meeting():
     assignee = next((agent for agent in AGENTS if agent['id'] == task['assignee']), AGENTS[-1])
     review_by_role = {row['reviewer']: row for row in review_rows}
     participants = ['director', 'research-lead', 'content-lead', 'manager', assignee['id']]
-    key = os.getenv('OPENAI_API_KEY')
+    key = ai_settings()[0]
     if key:
-        payload = {'model': os.getenv('OPENAI_MODEL', 'gpt-5-mini'), 'store': False,
-                   'instructions': ('Tạo cuộc họp ngắn bằng tiếng Việt giữa phó giám đốc, hai leader, quản lý và người nhận task. '
+        instructions = ('Tạo cuộc họp ngắn bằng tiếng Việt giữa phó giám đốc, hai leader, quản lý và người nhận task. '
                                     'Hai leader và quản lý phản biện chéo dựa trên review đã lưu; nếu chưa review thì nói rõ đang chờ, không giả vờ đã duyệt. '
                                     'Không khẳng định công việc chưa được ghi nhận. Chỉ trả JSON array có đúng 5 object, mỗi object gồm agent_id và text. '
-                                    f'agent_id theo đúng thứ tự: {", ".join(participants)}.'),
-                   'input': json.dumps({'task': task, 'reviews': review_rows}, ensure_ascii=False)}
-        request = Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
-                          headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}, method='POST')
+                                    f'agent_id theo đúng thứ tự: {", ".join(participants)}.')
         try:
-            with urlopen(request, timeout=60) as response:
-                result = json.load(response)
-            raw = '\n'.join(part.get('text', '') for item in result.get('output', [])
-                            for part in item.get('content', []) if part.get('type') == 'output_text').strip()
+            raw = ai_text(instructions, json.dumps({'task': task, 'reviews': review_rows}, ensure_ascii=False))
             messages = json.loads(raw)
             if not isinstance(messages, list) or len(messages) != 5 or any(
                 not isinstance(item, dict) or item.get('agent_id') != participants[i] or not isinstance(item.get('text'), str) or not item['text'].strip()
@@ -166,7 +180,7 @@ def agent_meeting():
             ):
                 raise ValueError('Invalid meeting response')
             return {'mode': 'ai', 'task_id': task['id'], 'messages': messages}
-        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        except (ValueError, TypeError) as exc:
             raise HTTPException(502, 'AI meeting request failed') from exc
     messages = [{'agent_id': 'director', 'text': f'Task #{task["id"]}: {task["title"]}. Trạng thái: {task["status"]}. Mời các bộ phận đối chiếu kết quả.'}]
     for agent_id, topic in [('research-lead', 'nguồn và dữ kiện'), ('content-lead', 'nội dung và ngôn ngữ'), ('manager', 'tổng hợp phản biện')]:
@@ -191,7 +205,7 @@ def latest_review(db, task_id):
 
 @app.get('/api/health')
 def health():
-    return {'ok': True, 'ai_configured': bool(os.getenv('OPENAI_API_KEY'))}
+    return {'ok': True, 'ai_configured': bool(ai_settings()[0]), 'ai_provider': os.getenv('AI_PROVIDER', 'openai').lower()}
 
 @app.get('/api/tasks/{task_id}/sources')
 def sources(task_id: int):
@@ -272,28 +286,14 @@ def generate(task_id: int, data: GenerateRequest):
         content = (f'[BẢN MẪU] {task["title"]}\n\nBrief: {task["brief"]}\n\n'
                    'Đây là nội dung mô phỏng để kiểm tra quy trình. Cần biên tập và xác minh trước khi sử dụng.')
     else:
-        key = os.getenv('OPENAI_API_KEY')
-        if not key:
-            raise HTTPException(503, 'OPENAI_API_KEY is not configured')
         instructions = ('Bạn là trợ lý nghiên cứu và viết nội dung Facebook. Với tin tức Mỹ, phân biệt dữ kiện và quan điểm, '
                         'không bịa sự kiện, ngày tháng hay trích dẫn. Chỉ sử dụng nguồn được cung cấp và nêu chỗ cần xác minh. '
                         'Với truyện AI, ghi rõ là hư cấu. Không tự xuất bản nội dung.')
-        payload = {'model': os.getenv('OPENAI_MODEL', 'gpt-5-mini'), 'instructions': instructions,
-                   'input': json.dumps({'mode': data.mode, 'category': task['category'], 'title': task['title'],
+        content = ai_text(instructions,
+                   json.dumps({'mode': data.mode, 'category': task['category'], 'title': task['title'],
                                         'brief': task['brief'], 'sources': source_rows,
                                         'research_notes': research_note['output'] if research_note and data.mode == 'draft' else '',
-                                        'revision_feedback': previous_review['note'] if previous_review and previous_review['decision'] == 'revise' else ''}, ensure_ascii=False), 'store': False}
-        request = Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
-                          headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}, method='POST')
-        try:
-            with urlopen(request, timeout=60) as response:
-                result = json.load(response)
-            content = '\n'.join(part.get('text', '') for item in result.get('output', [])
-                                for part in item.get('content', []) if part.get('type') == 'output_text')
-            if not content:
-                raise HTTPException(502, 'AI returned no text')
-        except (HTTPError, URLError, TimeoutError) as exc:
-            raise HTTPException(502, 'AI provider request failed') from exc
+                                        'revision_feedback': previous_review['note'] if previous_review and previous_review['decision'] == 'revise' else ''}, ensure_ascii=False))
     return {'mode': data.mode, 'content': content, 'demo': data.demo}
 
 @app.get('/api/agents')
@@ -367,25 +367,15 @@ def agent_steps(task_id: int):
         return [dict(row) for row in db.execute('SELECT * FROM agent_steps WHERE task_id=? ORDER BY id DESC', (task_id,))]
 
 def ai_review(task, draft, reviewer, previous_reviews, sources):
-    key = os.getenv('OPENAI_API_KEY')
-    payload = {
-        'model': os.getenv('OPENAI_MODEL', 'gpt-5-mini'), 'store': False,
-        'instructions': ('Bạn là ' + reviewer['name'] + ' trong quy trình review chéo của RS68. '
+    instructions = ('Bạn là ' + reviewer['name'] + ' trong quy trình review chéo của RS68. '
                          'Đọc nhận xét của các vai trò trước, nêu rõ điểm đồng ý hoặc phản biện trong note; tự đánh giá độc lập, không tự động tin người trước. '
                          'Đánh giá độc lập bản nháp theo brief và nguồn đã lưu. Với tin tức: không xác nhận sự kiện nếu nguồn không hỗ trợ; '
                          'với truyện AI: kiểm tra nhãn hư cấu. Không truy cập web, không bịa bằng chứng. '
                          'Chỉ trả một JSON object gồm decision (pass hoặc revise), checklist '
                          '(brief, facts, originality, language: boolean), note (lý do ngắn). '
-                         'Chỉ pass khi cả bốn tiêu chí chắc chắn đạt. Nếu không chắc chắn, revise và ghi rõ cần kiểm tra.'),
-        'input': json.dumps({'task': dict(task), 'draft': dict(draft), 'previous_reviews': previous_reviews, 'sources': sources}, ensure_ascii=False),
-    }
-    request = Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
-                      headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}, method='POST')
+                         'Chỉ pass khi cả bốn tiêu chí chắc chắn đạt. Nếu không chắc chắn, revise và ghi rõ cần kiểm tra.')
     try:
-        with urlopen(request, timeout=60) as response:
-            result = json.load(response)
-        raw = '\n'.join(part.get('text', '') for item in result.get('output', [])
-                        for part in item.get('content', []) if part.get('type') == 'output_text').strip()
+        raw = ai_text(instructions, json.dumps({'task': dict(task), 'draft': dict(draft), 'previous_reviews': previous_reviews, 'sources': sources}, ensure_ascii=False))
         parsed = json.loads(raw)
         checks = parsed['checklist']
         required = {'brief', 'facts', 'originality', 'language'}
@@ -397,12 +387,12 @@ def ai_review(task, draft, reviewer, previous_reviews, sources):
         if parsed['decision'] == 'revise' and not note:
             raise ValueError('Missing revision note')
         return ReviewCreate(reviewer=reviewer['id'], decision=parsed['decision'], checklist=checks, note=note)
-    except (HTTPError, URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(502, 'AI review failed or returned invalid JSON') from exc
 
 def run_agent_cycle(task_id: int):
-    if not os.getenv('OPENAI_API_KEY'):
-        raise HTTPException(503, 'OPENAI_API_KEY is not configured')
+    if not ai_settings()[0]:
+        raise HTTPException(503, 'AI provider key is not configured')
     if not RUN_LOCK.acquire(blocking=False):
         raise HTTPException(409, 'An agent workflow is already running')
     try:
@@ -466,7 +456,7 @@ def run_task_agents(task_id: int):
 def auto_agent_loop():
     retry_after = {}
     while True:
-        if os.getenv('OPENAI_API_KEY'):
+        if ai_settings()[0]:
             row = None
             try:
                 with connect() as db:

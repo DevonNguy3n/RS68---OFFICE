@@ -1,6 +1,8 @@
 import os
 import tempfile
 import unittest
+import json
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -59,6 +61,23 @@ class WorkflowTests(unittest.TestCase):
         finally:
             if old_key is not None:
                 os.environ['OPENAI_API_KEY'] = old_key
+
+    def test_muse2api_routes_agent_chat_to_local_responses_api(self):
+        class FakeResponse:
+            def __enter__(self):
+                return BytesIO(json.dumps({'output': [{'content': [{'type': 'output_text', 'text': 'Đang xử lý task.'}]}]}).encode())
+
+            def __exit__(self, *_):
+                return False
+
+        with patch.dict(os.environ, {'AI_PROVIDER': 'muse2api', 'AI_API_KEY': 'test-local-key', 'AI_BASE_URL': 'http://127.0.0.1:18610/v1'}), patch.object(api, 'urlopen', return_value=FakeResponse()) as request_mock:
+            response = self.client.post('/api/agent-chat', json={'agent_id': 'writer', 'message': 'Tiến độ?'})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()['reply'], 'Đang xử lý task.')
+            request = request_mock.call_args.args[0]
+            self.assertEqual(request.full_url, 'http://127.0.0.1:18610/v1/responses')
+            self.assertEqual(request.get_header('Authorization'), 'Bearer test-local-key')
+            self.assertEqual(json.loads(request.data)['model'], 'muse-spark')
 
     def test_meeting_names_all_review_roles_without_claiming_unrecorded_work(self):
         with patch.dict(os.environ, {'OPENAI_API_KEY': ''}):
