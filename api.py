@@ -75,6 +75,95 @@ class GenerateRequest(BaseModel):
     mode: str = Field(pattern='^(research|draft)$')
     demo: bool = True
 
+class AgentMessage(BaseModel):
+    agent_id: str
+    message: str = Field(min_length=1, max_length=2000)
+
+@app.get('/api/dashboard')
+def dashboard():
+    with connect() as db:
+        by_status = {row['status']: row['count'] for row in db.execute('SELECT status, COUNT(*) AS count FROM tasks GROUP BY status')}
+        by_category = {row['category']: row['count'] for row in db.execute('SELECT category, COUNT(*) AS count FROM tasks GROUP BY category')}
+        assigned = {row['assignee']: row['count'] for row in db.execute('SELECT assignee, COUNT(*) AS count FROM tasks GROUP BY assignee')}
+        return {
+            'total': sum(by_status.values()), 'by_status': by_status, 'by_category': by_category,
+            'by_agent': assigned,
+            'sources': db.execute('SELECT COUNT(*) FROM sources').fetchone()[0],
+            'verified_sources': db.execute('SELECT COUNT(*) FROM sources WHERE verified=1').fetchone()[0],
+            'drafts': db.execute('SELECT COUNT(*) FROM drafts').fetchone()[0],
+            'reviews': db.execute('SELECT COUNT(*) FROM reviews').fetchone()[0],
+        }
+
+@app.post('/api/agent-chat')
+def agent_chat(data: AgentMessage):
+    agent = next((item for item in AGENTS if item['id'] == data.agent_id), None)
+    if not agent:
+        raise HTTPException(422, 'Unknown agent')
+    with connect() as db:
+        task_rows = [dict(row) for row in db.execute('SELECT id,title,status,brief FROM tasks WHERE assignee=? ORDER BY id DESC LIMIT 5', (data.agent_id,))]
+    key = os.getenv('OPENAI_API_KEY')
+    if not key:
+        if task_rows:
+            latest = task_rows[0]
+            reply = f'Tôi đang phụ trách "{latest["title"]}" (trạng thái: {latest["status"]}). Bạn có thể mở hồ sơ task để xem nguồn, bản nháp và QC.'
+        else:
+            reply = 'Hiện tôi chưa được giao task nào. Hãy giao việc trong Trung tâm điều hành để bắt đầu.'
+        return {'agent_id': data.agent_id, 'reply': reply, 'mode': 'local', 'tasks': task_rows}
+    payload = {'model': os.getenv('OPENAI_MODEL', 'gpt-5.5'), 'store': False,
+               'instructions': f'Bạn là {agent["name"]} của công ty content AI. Vai trò: {agent["role"]}. Trả lời ngắn bằng tiếng Việt. Chỉ xem dữ liệu task cung cấp là sự thật; không bịa tiến độ, nguồn tin hoặc công việc đã làm. Không tự xuất bản.',
+               'input': json.dumps({'user_message': data.message, 'assigned_tasks': task_rows}, ensure_ascii=False)}
+    request = Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
+                      headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}, method='POST')
+    try:
+        with urlopen(request, timeout=60) as response:
+            result = json.load(response)
+        reply = '\n'.join(part.get('text', '') for item in result.get('output', [])
+                          for part in item.get('content', []) if part.get('type') == 'output_text')
+        if not reply:
+            raise HTTPException(502, 'AI returned no text')
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise HTTPException(502, 'AI provider request failed') from exc
+    return {'agent_id': data.agent_id, 'reply': reply, 'mode': 'ai', 'tasks': task_rows}
+
+@app.get('/api/agent-meeting')
+def agent_meeting():
+    with connect() as db:
+        task = db.execute('SELECT id,title,status,assignee FROM tasks ORDER BY id DESC LIMIT 1').fetchone()
+    if not task:
+        return {'mode': 'local', 'messages': [{'agent_id': 'director', 'text': 'Chưa có nhiệm vụ. Hãy tạo task để bắt đầu trao đổi.'}]}
+    task = dict(task)
+    assignee = next((agent for agent in AGENTS if agent['id'] == task['assignee']), AGENTS[-1])
+    key = os.getenv('OPENAI_API_KEY')
+    if key:
+        payload = {'model': os.getenv('OPENAI_MODEL', 'gpt-5.5'), 'store': False,
+                   'instructions': ('Tạo cuộc trao đổi công việc ngắn bằng tiếng Việt giữa phó giám đốc, quản lý và nhân viên được giao task. '
+                                    'Chỉ dựa trên dữ liệu task được cung cấp. Không khẳng định đã thực hiện việc chưa được ghi nhận. '
+                                    'Chỉ trả JSON array có đúng 3 object, mỗi object gồm agent_id và text. '
+                                    f'agent_id lần lượt là director, manager, {assignee["id"]}.'),
+                   'input': json.dumps(task, ensure_ascii=False)}
+        request = Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
+                          headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}, method='POST')
+        try:
+            with urlopen(request, timeout=60) as response:
+                result = json.load(response)
+            raw = '\n'.join(part.get('text', '') for item in result.get('output', [])
+                            for part in item.get('content', []) if part.get('type') == 'output_text').strip()
+            messages = json.loads(raw)
+            allowed = {'director', 'manager', assignee['id']}
+            if not isinstance(messages, list) or len(messages) != 3 or any(
+                not isinstance(item, dict) or item.get('agent_id') not in allowed or not isinstance(item.get('text'), str)
+                for item in messages
+            ):
+                raise ValueError('Invalid meeting response')
+            return {'mode': 'ai', 'task_id': task['id'], 'messages': messages}
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            raise HTTPException(502, 'AI meeting request failed') from exc
+    return {'mode': 'local', 'task_id': task['id'], 'messages': [
+        {'agent_id': 'director', 'text': f'Task #{task["id"]}: {task["title"]}. Trạng thái hiện tại: {task["status"]}.'},
+        {'agent_id': 'manager', 'text': f'{assignee["name"]} đang được giao nhiệm vụ này. Tôi sẽ theo dõi tiến độ trong hồ sơ task.'},
+        {'agent_id': assignee['id'], 'text': 'Tôi sẽ làm theo brief và cập nhật qua nguồn, bản nháp hoặc kết quả của task.'},
+    ]}
+
 def task_or_404(db, task_id):
     row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
     if not row:

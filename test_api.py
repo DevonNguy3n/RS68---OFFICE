@@ -37,6 +37,28 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('[BẢN MẪU]', response.json()['content'])
 
+    def test_dashboard_uses_saved_records(self):
+        initial = self.client.get('/api/dashboard').json()
+        self.assertEqual(initial['total'], 1)
+        self.assertEqual(initial['by_category']['news'], 1)
+        self.assertEqual(initial['by_agent']['writer'], 1)
+        self.assertEqual(initial['verified_sources'], 0)
+        self.client.post(f'/api/tasks/{self.task_id}/sources', json={
+            'title': 'Nguồn chính thức', 'url': 'https://example.org/story', 'verified': True,
+        })
+        self.assertEqual(self.client.get('/api/dashboard').json()['verified_sources'], 1)
+
+    def test_agent_chat_local_reply_uses_assigned_task(self):
+        old_key = os.environ.pop('OPENAI_API_KEY', None)
+        try:
+            response = self.client.post('/api/agent-chat', json={'agent_id': 'writer', 'message': 'Tiến độ?'})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()['mode'], 'local')
+            self.assertIn('Bản tin thử nghiệm', response.json()['reply'])
+        finally:
+            if old_key is not None:
+                os.environ['OPENAI_API_KEY'] = old_key
+
     def test_qc_requires_draft_and_independent_review(self):
         self.assertEqual(self.move('ASSIGNED').status_code, 200)
         self.assertEqual(self.move('IN_PROGRESS').status_code, 200)
