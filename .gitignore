@@ -1,0 +1,9 @@
+node_modules/
+.npm-cache/
+.python-deps/
+.pip-cache/
+dist/
+__pycache__/
+.env
+*.db
+.venv/
