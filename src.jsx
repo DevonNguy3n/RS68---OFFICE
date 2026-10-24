@@ -37,7 +37,7 @@ function TaskWorkspace({task,onRefresh}) {
 }
 function App(){
   const [agents,setAgents]=useState(fallbackAgents), [tasks,setTasks]=useState([]), [selected,setSelected]=useState(null), [selectedTask,setSelectedTask]=useState(null), [panelOpen,setPanelOpen]=useState(false), [error,setError]=useState(''), [form,setForm]=useState({title:'',category:'news',assignee:'researcher',brief:''}), [reason,setReason]=useState(''), [result,setResult]=useState('');
-  const [view,setView]=useState('all'),[dashboard,setDashboard]=useState(null),[health,setHealth]=useState(null),[chatInput,setChatInput]=useState(''),[chatLog,setChatLog]=useState([]),[meeting,setMeeting]=useState(null),[chatBusy,setChatBusy]=useState(false),[focusMode,setFocusMode]=useState(false);
+  const [view,setView]=useState('all'),[dashboard,setDashboard]=useState(null),[health,setHealth]=useState(null),[chatInput,setChatInput]=useState(''),[chatLog,setChatLog]=useState([]),[meeting,setMeeting]=useState(null),[chatBusy,setChatBusy]=useState(false),[focusMode,setFocusMode]=useState(()=>window.innerWidth<1200);
   const refresh=()=>api('/tasks').then(setTasks).catch(e=>setError(e.message));
   const refreshDashboard=()=>api('/dashboard').then(setDashboard).catch(()=>{});
   useEffect(()=>{api('/agents').then(setAgents).catch(()=>{});api('/health').then(setHealth).catch(()=>{});refresh();refreshDashboard();const timer=setInterval(()=>{refresh();refreshDashboard()},15000);return ()=>clearInterval(timer)},[]);
