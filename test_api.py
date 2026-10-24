@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 import api
@@ -70,11 +71,25 @@ class WorkflowTests(unittest.TestCase):
         checklist = {'brief': True, 'facts': True, 'originality': True, 'language': True}
         own = self.client.post(f'/api/tasks/{self.task_id}/reviews', json={'reviewer': 'writer', 'decision': 'pass', 'checklist': checklist})
         self.assertEqual(own.status_code, 403)
-        good = self.client.post(f'/api/tasks/{self.task_id}/reviews', json={'reviewer': 'content-lead', 'decision': 'pass', 'checklist': checklist})
-        self.assertEqual(good.status_code, 201)
+        for reviewer in ('content-lead', 'manager', 'director'):
+            good = self.client.post(f'/api/tasks/{self.task_id}/reviews', json={'reviewer': reviewer, 'decision': 'pass', 'checklist': checklist})
+            self.assertEqual(good.status_code, 201)
+            if reviewer != 'director':
+                self.assertEqual(self.move('APPROVED').status_code, 422)
         self.assertEqual(self.move('APPROVED').status_code, 200)
         self.assertEqual(self.move('COMPLETED').status_code, 200)
         self.assertGreaterEqual(len(self.client.get(f'/api/tasks/{self.task_id}/events').json()), 6)
+
+    def test_agent_loop_requires_source_and_cross_layer_reviews(self):
+        self.assertEqual(self.move('ASSIGNED').status_code, 200)
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'}), patch.object(api, 'generate', side_effect=lambda _id, req: {'content': 'Nội dung nghiên cứu có nguồn' if req.mode == 'research' else 'Bản nháp tin tức có nguồn xác minh'}), patch.object(api, 'ai_review', side_effect=lambda _task, _draft, reviewer: api.ReviewCreate(reviewer=reviewer['id'], decision='pass', checklist={'brief': True, 'facts': True, 'originality': True, 'language': True})):
+            waiting = self.client.post(f'/api/tasks/{self.task_id}/run')
+            self.assertEqual(waiting.json()['action'], 'waiting_for_verified_source')
+            self.client.post(f'/api/tasks/{self.task_id}/sources', json={'title': 'Nguồn chính thức', 'url': 'https://example.org/story', 'verified': True})
+            actions = [self.client.post(f'/api/tasks/{self.task_id}/run').json()['action'] for _ in range(5)]
+        self.assertEqual(actions, ['draft_submitted', 'review_passed', 'review_passed', 'review_passed', 'approved'])
+        self.assertEqual(self.client.get(f'/api/tasks/{self.task_id}/agent-steps').status_code, 200)
+        self.assertEqual(self.client.get('/api/tasks').json()[0]['status'], 'APPROVED')
 
 
 if __name__ == '__main__':

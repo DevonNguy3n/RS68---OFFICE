@@ -3,6 +3,8 @@ from pathlib import Path
 import os
 import sqlite3
 import json
+import threading
+import time
 from contextlib import contextmanager
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -41,6 +43,7 @@ def init_db():
         db.execute('CREATE TABLE IF NOT EXISTS sources (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, note TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS drafts (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, version INTEGER NOT NULL, body TEXT NOT NULL, author TEXT NOT NULL, created_at TEXT NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, draft_id INTEGER NOT NULL, reviewer TEXT NOT NULL, decision TEXT NOT NULL, checklist TEXT NOT NULL, note TEXT NOT NULL, created_at TEXT NOT NULL)')
+        db.execute('CREATE TABLE IF NOT EXISTS agent_steps (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, agent_id TEXT NOT NULL, stage TEXT NOT NULL, output TEXT NOT NULL, created_at TEXT NOT NULL)')
 
 init_db()
 
@@ -109,7 +112,7 @@ def agent_chat(data: AgentMessage):
         else:
             reply = 'Hiện tôi chưa được giao task nào. Hãy giao việc trong Trung tâm điều hành để bắt đầu.'
         return {'agent_id': data.agent_id, 'reply': reply, 'mode': 'local', 'tasks': task_rows}
-    payload = {'model': os.getenv('OPENAI_MODEL', 'gpt-5.5'), 'store': False,
+    payload = {'model': os.getenv('OPENAI_MODEL', 'gpt-5-mini'), 'store': False,
                'instructions': f'Bạn là {agent["name"]} của công ty content AI. Vai trò: {agent["role"]}. Trả lời ngắn bằng tiếng Việt. Chỉ xem dữ liệu task cung cấp là sự thật; không bịa tiến độ, nguồn tin hoặc công việc đã làm. Không tự xuất bản.',
                'input': json.dumps({'user_message': data.message, 'assigned_tasks': task_rows}, ensure_ascii=False)}
     request = Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
@@ -135,7 +138,7 @@ def agent_meeting():
     assignee = next((agent for agent in AGENTS if agent['id'] == task['assignee']), AGENTS[-1])
     key = os.getenv('OPENAI_API_KEY')
     if key:
-        payload = {'model': os.getenv('OPENAI_MODEL', 'gpt-5.5'), 'store': False,
+        payload = {'model': os.getenv('OPENAI_MODEL', 'gpt-5-mini'), 'store': False,
                    'instructions': ('Tạo cuộc trao đổi công việc ngắn bằng tiếng Việt giữa phó giám đốc, quản lý và nhân viên được giao task. '
                                     'Chỉ dựa trên dữ liệu task được cung cấp. Không khẳng định đã thực hiện việc chưa được ghi nhận. '
                                     'Chỉ trả JSON array có đúng 3 object, mỗi object gồm agent_id và text. '
@@ -240,6 +243,8 @@ def add_review(task_id: int, data: ReviewCreate):
             raise HTTPException(422, 'Draft required')
         if data.reviewer == draft['author']:
             raise HTTPException(403, 'Author cannot review own draft')
+        if db.execute('SELECT 1 FROM reviews WHERE draft_id=? AND reviewer=?', (draft['id'], data.reviewer)).fetchone():
+            raise HTTPException(409, 'Reviewer already reviewed this draft')
         cursor = db.execute('INSERT INTO reviews(task_id,draft_id,reviewer,decision,checklist,note,created_at) VALUES(?,?,?,?,?,?,?)',
                             (task_id, draft['id'], data.reviewer, data.decision, json.dumps(data.checklist), data.note, datetime.now(timezone.utc).isoformat()))
         record_event(db, task_id, None, 'QC_REVIEWED', data.decision)
@@ -250,6 +255,8 @@ def generate(task_id: int, data: GenerateRequest):
     with connect() as db:
         task = task_or_404(db, task_id)
         source_rows = [dict(row) for row in db.execute('SELECT title,url,note,verified FROM sources WHERE task_id=?', (task_id,))]
+        previous_review = latest_review(db, task_id)
+        research_note = db.execute('SELECT output FROM agent_steps WHERE task_id=? AND stage="research" ORDER BY id DESC LIMIT 1', (task_id,)).fetchone()
     if data.mode == 'draft' and task['category'] == 'news' and not any(row['verified'] for row in source_rows):
         raise HTTPException(422, 'Verified source required for news')
     if data.demo:
@@ -262,9 +269,11 @@ def generate(task_id: int, data: GenerateRequest):
         instructions = ('Bạn là trợ lý nghiên cứu và viết nội dung Facebook. Với tin tức Mỹ, phân biệt dữ kiện và quan điểm, '
                         'không bịa sự kiện, ngày tháng hay trích dẫn. Chỉ sử dụng nguồn được cung cấp và nêu chỗ cần xác minh. '
                         'Với truyện AI, ghi rõ là hư cấu. Không tự xuất bản nội dung.')
-        payload = {'model': os.getenv('OPENAI_MODEL', 'gpt-5.5'), 'instructions': instructions,
+        payload = {'model': os.getenv('OPENAI_MODEL', 'gpt-5-mini'), 'instructions': instructions,
                    'input': json.dumps({'mode': data.mode, 'category': task['category'], 'title': task['title'],
-                                        'brief': task['brief'], 'sources': source_rows}, ensure_ascii=False), 'store': False}
+                                        'brief': task['brief'], 'sources': source_rows,
+                                        'research_notes': research_note['output'] if research_note and data.mode == 'draft' else '',
+                                        'revision_feedback': previous_review['note'] if previous_review and previous_review['decision'] == 'revise' else ''}, ensure_ascii=False), 'store': False}
         request = Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
                           headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}, method='POST')
         try:
@@ -320,6 +329,11 @@ def transition(task_id: int, data: Transition):
             newest_draft = db.execute('SELECT id FROM drafts WHERE task_id=? ORDER BY id DESC LIMIT 1', (task_id,)).fetchone()
             if not newest_draft or review['draft_id'] != newest_draft['id']:
                 raise HTTPException(422, 'Latest draft needs QC review')
+            if data.status == 'APPROVED':
+                passed = {item['reviewer'] for item in db.execute(
+                    'SELECT reviewer FROM reviews WHERE draft_id=? AND decision="pass"', (newest_draft['id'],))}
+                if not {'content-lead', 'manager', 'director'} <= passed:
+                    raise HTTPException(422, 'Cross-layer reviews from content lead, manager and director required')
         now = datetime.now(timezone.utc).isoformat()
         db.execute('UPDATE tasks SET status=?, result=? WHERE id=?', (data.status, result, task_id))
         db.execute('INSERT INTO events(task_id,from_status,to_status,reason,created_at) VALUES(?,?,?,?,?)', (task_id, row['status'], data.status, data.reason, now))
@@ -329,3 +343,136 @@ def transition(task_id: int, data: Transition):
 def events(task_id: int):
     with connect() as db:
         return [dict(row) for row in db.execute('SELECT * FROM events WHERE task_id=? ORDER BY id', (task_id,))]
+
+RUN_LOCK = threading.Lock()
+
+def save_agent_step(task_id: int, agent_id: str, stage: str, output: str):
+    with connect() as db:
+        db.execute('INSERT INTO agent_steps(task_id,agent_id,stage,output,created_at) VALUES(?,?,?,?,?)',
+                   (task_id, agent_id, stage, output, datetime.now(timezone.utc).isoformat()))
+
+@app.get('/api/tasks/{task_id}/agent-steps')
+def agent_steps(task_id: int):
+    with connect() as db:
+        task_or_404(db, task_id)
+        return [dict(row) for row in db.execute('SELECT * FROM agent_steps WHERE task_id=? ORDER BY id DESC', (task_id,))]
+
+def ai_review(task, draft, reviewer):
+    key = os.getenv('OPENAI_API_KEY')
+    payload = {
+        'model': os.getenv('OPENAI_MODEL', 'gpt-5-mini'), 'store': False,
+        'instructions': ('Bạn là ' + reviewer['name'] + ' trong quy trình review chéo của RS68. '
+                         'Đánh giá độc lập bản nháp theo brief và nguồn đã lưu. Với tin tức: không xác nhận sự kiện nếu nguồn không hỗ trợ; '
+                         'với truyện AI: kiểm tra nhãn hư cấu. Không truy cập web, không bịa bằng chứng. '
+                         'Chỉ trả một JSON object gồm decision (pass hoặc revise), checklist '
+                         '(brief, facts, originality, language: boolean), note (lý do ngắn). '
+                         'Chỉ pass khi cả bốn tiêu chí chắc chắn đạt. Nếu không chắc chắn, revise và ghi rõ cần kiểm tra.'),
+        'input': json.dumps({'task': dict(task), 'draft': dict(draft)}, ensure_ascii=False),
+    }
+    request = Request('https://api.openai.com/v1/responses', data=json.dumps(payload).encode(),
+                      headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}, method='POST')
+    try:
+        with urlopen(request, timeout=60) as response:
+            result = json.load(response)
+        raw = '\n'.join(part.get('text', '') for item in result.get('output', [])
+                        for part in item.get('content', []) if part.get('type') == 'output_text').strip()
+        parsed = json.loads(raw)
+        checks = parsed['checklist']
+        required = {'brief', 'facts', 'originality', 'language'}
+        if parsed['decision'] not in {'pass', 'revise'} or set(checks) != required or any(type(value) is not bool for value in checks.values()):
+            raise ValueError('Invalid review fields')
+        if parsed['decision'] == 'pass' and not all(checks.values()):
+            raise ValueError('Inconsistent review')
+        note = str(parsed.get('note', '')).strip()
+        if parsed['decision'] == 'revise' and not note:
+            raise ValueError('Missing revision note')
+        return ReviewCreate(reviewer=reviewer['id'], decision=parsed['decision'], checklist=checks, note=note)
+    except (HTTPError, URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(502, 'AI review failed or returned invalid JSON') from exc
+
+def run_agent_cycle(task_id: int):
+    if not os.getenv('OPENAI_API_KEY'):
+        raise HTTPException(503, 'OPENAI_API_KEY is not configured')
+    if not RUN_LOCK.acquire(blocking=False):
+        raise HTTPException(409, 'An agent workflow is already running')
+    try:
+        with connect() as db:
+            task = dict(task_or_404(db, task_id))
+            verified = db.execute('SELECT COUNT(*) FROM sources WHERE task_id=? AND verified=1', (task_id,)).fetchone()[0]
+            revisions = db.execute('SELECT COUNT(*) FROM reviews WHERE task_id=? AND decision="revise"', (task_id,)).fetchone()[0]
+        status = task['status']
+        if status not in {'ASSIGNED', 'IN_PROGRESS', 'SUBMITTED', 'REVISION_REQUIRED'}:
+            return {'task_id': task_id, 'status': status, 'action': 'idle'}
+        if task['category'] == 'news' and not verified:
+            return {'task_id': task_id, 'status': status, 'action': 'waiting_for_verified_source'}
+        if status == 'REVISION_REQUIRED':
+            if revisions >= 2:
+                return {'task_id': task_id, 'status': status, 'action': 'human_review_required'}
+            transition(task_id, Transition(status='IN_PROGRESS'))
+            status = 'IN_PROGRESS'
+        if status == 'ASSIGNED':
+            transition(task_id, Transition(status='IN_PROGRESS'))
+            status = 'IN_PROGRESS'
+        if status == 'IN_PROGRESS':
+            research = generate(task_id, GenerateRequest(mode='research', demo=False))['content']
+            save_agent_step(task_id, 'researcher', 'research', research)
+            draft_text = generate(task_id, GenerateRequest(mode='draft', demo=False))['content']
+            draft = add_draft(task_id, DraftCreate(body=draft_text, author='writer'))
+            save_agent_step(task_id, 'writer', 'draft', f'Đã lưu bản nháp v{draft["version"]}')
+            transition(task_id, Transition(status='SUBMITTED', result=f'Bản nháp v{draft["version"]} chờ QC'))
+            return {'task_id': task_id, 'status': 'SUBMITTED', 'action': 'draft_submitted'}
+        with connect() as db:
+            task = dict(task_or_404(db, task_id))
+            draft = db.execute('SELECT * FROM drafts WHERE task_id=? ORDER BY id DESC LIMIT 1', (task_id,)).fetchone()
+            if not draft:
+                raise HTTPException(422, 'Draft required')
+            draft = dict(draft)
+            reviewed = {row['reviewer'] for row in db.execute('SELECT reviewer FROM reviews WHERE draft_id=?', (draft['id'],))}
+        for agent_id in ('content-lead', 'manager', 'director'):
+            if agent_id in reviewed:
+                continue
+            reviewer = next(agent for agent in AGENTS if agent['id'] == agent_id)
+            decision = ai_review(task, draft, reviewer)
+            add_review(task_id, decision)
+            save_agent_step(task_id, agent_id, 'review', f'{decision.decision}: {decision.note}')
+            if decision.decision == 'revise':
+                transition(task_id, Transition(status='REVISION_REQUIRED', reason=decision.note))
+                return {'task_id': task_id, 'status': 'REVISION_REQUIRED', 'action': 'revision_requested', 'reviewer': agent_id}
+            return {'task_id': task_id, 'status': 'SUBMITTED', 'action': 'review_passed', 'reviewer': agent_id}
+        transition(task_id, Transition(status='APPROVED'))
+        save_agent_step(task_id, 'director', 'approval', 'Đã duyệt qua ba tầng; chờ người dùng hoàn thành task.')
+        return {'task_id': task_id, 'status': 'APPROVED', 'action': 'approved'}
+    finally:
+        RUN_LOCK.release()
+
+@app.post('/api/tasks/{task_id}/run')
+def run_task_agents(task_id: int):
+    return run_agent_cycle(task_id)
+
+def auto_agent_loop():
+    retry_after = {}
+    while True:
+        if os.getenv('OPENAI_API_KEY'):
+            row = None
+            try:
+                with connect() as db:
+                    candidates = db.execute('''SELECT t.id FROM tasks t WHERE t.status IN ("ASSIGNED","IN_PROGRESS","SUBMITTED","REVISION_REQUIRED")
+                        AND (t.category="story" OR EXISTS (SELECT 1 FROM sources s WHERE s.task_id=t.id AND s.verified=1))
+                        AND (t.status!="REVISION_REQUIRED" OR (SELECT COUNT(*) FROM reviews r WHERE r.task_id=t.id AND r.decision="revise")<2)
+                        ORDER BY t.id''').fetchall()
+                    row = next((item for item in candidates if retry_after.get(item['id'], 0) <= time.monotonic()), None)
+                if row:
+                    run_agent_cycle(row['id'])
+                    retry_after.pop(row['id'], None)
+            except (HTTPException, OSError, ValueError) as exc:
+                if row:
+                    retry_after[row['id']] = time.monotonic() + 300
+                    save_agent_step(row['id'], 'system', 'error', str(exc))
+        threading.Event().wait(20)
+
+@app.on_event('startup')
+def start_agent_loop():
+    worker = getattr(app.state, 'agent_worker', None)
+    if worker is None or not worker.is_alive():
+        app.state.agent_worker = threading.Thread(target=auto_agent_loop, daemon=True, name='rs68-agent-loop')
+        app.state.agent_worker.start()
